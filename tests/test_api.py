@@ -507,3 +507,232 @@ def test_hierarchy_existing_endpoints_unchanged():
     resp = post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}])
     assert resp.status_code == 200
     assert resp.json()["rules"][0]["status"] == "full"
+
+
+# ---------- /routes/resolve ----------
+
+def post_resolve(routes, targets):
+    return client.post(
+        "/routes/resolve", json={"routes": routes, "targets": targets}
+    )
+
+
+def test_resolve_lpm_lowest_metric_and_ecmp_dedup():
+    resp = post_resolve(
+        [
+            {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.254", "metric": 50},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},  # 重复
+            {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 60},
+            {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.2", "metric": 60},
+        ],
+        ["10.1.0.5", "10.2.2.2", "8.8.8.8", "172.16.0.1"],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 7
+    assert body["target_count"] == 4
+
+    results = body["results"]
+    # targets 输入顺序保持不变
+    assert [r["target"] for r in results] == [
+        "10.1.0.5",
+        "10.2.2.2",
+        "8.8.8.8",
+        "172.16.0.1",
+    ]
+    assert results[0] == {
+        "target": "10.1.0.5",
+        "status": "reachable",
+        "matched_cidr": "10.1.0.0/16",
+        "metric": 60,
+        "next_hops": ["10.1.0.1", "10.1.0.2"],
+    }
+    assert results[1] == {
+        "target": "10.2.2.2",
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 20,
+        "next_hops": ["10.0.0.1", "10.0.0.2"],  # 去重且按 routes 顺序
+    }
+    for outside in results[2:]:
+        assert outside["status"] == "reachable"
+        assert outside["matched_cidr"] == "0.0.0.0/0"
+        assert outside["metric"] == 100
+        assert outside["next_hops"] == ["192.0.2.254"]
+
+    # ECMP 各下一跳分别计数；顺序按 next_hop 在 routes 中首次出现位置
+    assert body["summary"] == {
+        "reachable_count": 4,
+        "unreachable_count": 0,
+        "next_hop_counts": [
+            {"next_hop": "192.0.2.254", "target_count": 2},
+            {"next_hop": "10.0.0.1", "target_count": 1},
+            {"next_hop": "10.0.0.2", "target_count": 1},
+            {"next_hop": "10.1.0.1", "target_count": 1},
+            {"next_hop": "10.1.0.2", "target_count": 1},
+        ],
+    }
+
+
+def test_resolve_unreachable_targets():
+    resp = post_resolve(
+        [
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 0},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 0},
+        ],
+        ["8.8.8.8", "10.0.0.1", "9.9.9.9"],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["status"] for r in body["results"]] == [
+        "unreachable",
+        "reachable",
+        "unreachable",
+    ]
+    assert body["results"][0] == {
+        "target": "8.8.8.8",
+        "status": "unreachable",
+        "matched_cidr": None,
+        "metric": None,
+        "next_hops": [],
+    }
+    # 仅 10.0.0.1 这一目标命中，ECMP 两个下一跳各计一次
+    assert body["summary"] == {
+        "reachable_count": 1,
+        "unreachable_count": 2,
+        "next_hop_counts": [
+            {"next_hop": "10.0.0.1", "target_count": 1},
+            {"next_hop": "10.0.0.2", "target_count": 1},
+        ],
+    }
+
+
+def test_resolve_empty_routes_all_unreachable():
+    resp = post_resolve([], ["8.8.8.8"])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 0
+    assert body["results"][0]["status"] == "unreachable"
+    assert body["summary"] == {
+        "reachable_count": 0,
+        "unreachable_count": 1,
+        "next_hop_counts": [],
+    }
+
+
+def test_resolve_bare_ip_accepted_for_target_and_route():
+    resp = post_resolve(
+        [{"cidr": "8.8.8.8", "next_hop": "1.1.1.1", "metric": 5}],
+        ["8.8.8.8"],
+    )
+    assert resp.status_code == 200
+    item = resp.json()["results"][0]
+    assert item["matched_cidr"] == "8.8.8.8/32"
+    assert item["metric"] == 5
+    assert item["next_hops"] == ["1.1.1.1"]
+
+
+def test_resolve_metric_boundaries():
+    for metric in (0, 65535):
+        resp = post_resolve(
+            [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": metric}],
+            ["8.8.8.8"],
+        )
+        assert resp.status_code == 200, metric
+        assert resp.json()["results"][0]["metric"] == metric
+
+
+def test_resolve_duplicate_targets_422_lists_indexes():
+    resp = post_resolve(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8", "9.9.9.9", "8.8.8.8"],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "duplicate_targets",
+        "duplicates": [{"target": "8.8.8.8", "indexes": [0, 2]}],
+    }
+
+
+def test_resolve_validation_422():
+    valid_route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10}
+
+    # 缺少字段 / 请求体为空
+    assert client.post("/routes/resolve", json={}).status_code == 422
+    assert client.post(
+        "/routes/resolve", json={"routes": []}
+    ).status_code == 422
+    assert client.post(
+        "/routes/resolve", json={"targets": ["8.8.8.8"]}
+    ).status_code == 422
+
+    # 空目标 / 超过 500 个目标
+    assert post_resolve([valid_route], []).status_code == 422
+    too_many_targets = [f"8.8.{i // 256}.{i % 256}" for i in range(501)]
+    assert post_resolve([valid_route], too_many_targets).status_code == 422
+
+    # 超过 1000 条路由
+    too_many_routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1001)
+    ]
+    assert post_resolve(too_many_routes, ["8.8.8.8"]).status_code == 422
+
+    # 非法 route cidr（主机位非零 / 前缀越界 / IPv6）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        route = {"cidr": bad, "next_hop": "10.0.0.1", "metric": 10}
+        assert post_resolve([route], ["8.8.8.8"]).status_code == 422, bad
+
+    # 非法 next_hop（CIDR 写法 / IPv6 / 越界）
+    for bad in ["10.0.0.1/32", "::1", "999.0.0.1", ""]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": bad, "metric": 10}
+        assert post_resolve([route], ["8.8.8.8"]).status_code == 422, bad
+
+    # 非法 target（CIDR 写法 / IPv6 / 前导零 / 非字符串）
+    for bad in ["8.8.8.8/32", "2001:db8::1", "010.0.0.1", 8, True, None]:
+        assert post_resolve([valid_route], [bad]).status_code == 422, bad
+
+    # 非法 metric：越界 / bool / float / 字符串
+    for bad_metric in [-1, 65536, True, 1.5, "10"]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": bad_metric}
+        assert post_resolve([route], ["8.8.8.8"]).status_code == 422, bad_metric
+
+    # routes / targets 类型错误
+    assert client.post(
+        "/routes/resolve", json={"routes": "x", "targets": ["8.8.8.8"]}
+    ).status_code == 422
+    assert post_resolve(valid_route, ["8.8.8.8"]).status_code == 422
+
+
+def test_resolve_limits_accepted():
+    routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1000)
+    ]
+    targets = [f"8.8.{i // 256}.{i % 256}" for i in range(500)]
+    resp = post_resolve(routes, targets)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 1000
+    assert body["target_count"] == 500
+    assert len(body["results"]) == 500
+    assert body["summary"]["reachable_count"] == 500
+    assert body["summary"]["unreachable_count"] == 0
+    # 重复下一跳去重为一项，命中全部目标
+    assert body["summary"]["next_hop_counts"] == [
+        {"next_hop": "1.1.1.1", "target_count": 500}
+    ]
+
+
+def test_resolve_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    resp = post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}])
+    assert resp.status_code == 200
+    assert post_hierarchy(
+        [{"id": "a", "cidr": "10.0.0.0/8"}]
+    ).status_code == 200

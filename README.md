@@ -1,6 +1,7 @@
 # IPv4 遮蔽分析 API
 
-基于 **Python + FastAPI** 的 IPv4 CIDR 规则遮蔽（shadowing）分析与等价性比较服务。
+基于 **Python + FastAPI** 的 IPv4 CIDR 规则遮蔽（shadowing）分析、等价性比较、
+包含层级分析与静态路由解析服务。
 
 按输入顺序处理一组有序的 `allow` / `deny` CIDR 规则，计算每条规则
 **未被此前任何规则覆盖**的地址集合，并分为：
@@ -28,6 +29,12 @@
 每个节点给出 `total_addresses`，以及自身范围扣除全部直接子节点并集后的
 `exclusive_address_count` 与无损、数量最少的 `exclusive_cidrs`。
 
+`POST /routes/resolve` 则是静态路由解析：给定最多 1000 条路由
+（`cidr` / `next_hop` / `metric`）与最多 500 个唯一目标 IPv4 地址，对每个
+目标先做**最长前缀匹配（LPM）**，再在命中路由中保留**最低 metric** 的全部
+等价下一跳（ECMP），按 `routes` 输入顺序去重返回；未命中任何路由的目标标记为
+`unreachable`，并汇总每个 `next_hop` 命中的目标数。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -45,6 +52,7 @@ docker compose up --build -d
 - **比较接口：** `POST http://localhost:8000/compare`
 - **解释接口：** `POST http://localhost:8000/explain`
 - **层级接口：** `POST http://localhost:8000/cidrs/hierarchy`
+- **路由解析接口：** `POST http://localhost:8000/routes/resolve`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -598,6 +606,157 @@ curl -s http://localhost:8000/cidrs/hierarchy \
   -d '{"entries":[{"id":"net","cidr":"10.0.0.0/8"},{"id":"sub","cidr":"10.1.0.0/16"},{"id":"host","cidr":"10.1.1.1"}]}'
 ```
 
+---
+
+### `POST /routes/resolve`
+
+对一组唯一目标 IPv4 地址做静态路由解析。解析规则：
+
+1. **最长前缀匹配（LPM）**：在所有覆盖目标的路由中只保留前缀长度最大者；
+2. **最低 metric**：在 LPM 集合中再保留 metric 最小的**全部**路由，它们构成
+   等价多路径（ECMP）结果；
+3. ECMP 的 `next_hop` 按 **routes 输入顺序去重**后返回；
+4. 未命中任何路由的目标标记为 `unreachable`。
+
+- `routes`：**0～1000 条**路由（允许为空 `[]`，此时所有目标均不可达）。
+  - `cidr`：严格 IPv4 CIDR，校验与其他接口完全一致（纯 IP 按 `/32`、
+    主机位必须为零、禁止 IPv6）；
+  - `next_hop`：严格 **IPv4 地址**（纯地址，不允许 `10.0.0.1/32` 这类
+    CIDR 写法，禁止前导零与 IPv6）；
+  - `metric`：**0～65535** 的整数（不接受 `true`、`1.5` 等）。
+- `targets`：**1～500 个**唯一目标 IPv4 地址（纯地址，校验同 `next_hop`）；
+  重复时返回 **422** 并在 `detail.duplicates` 中列出冲突位置。
+- `results` **严格保持 targets 输入顺序**；`summary.next_hop_counts` 汇总每个
+  next_hop 命中的**目标数**——同一 ECMP 结果中的各下一跳**分别计数一次**，
+  仅列出实际命中过的下一跳，按其在 `routes` 中的首次出现位置排序。
+
+全程只做 32 位整数比较，**不逐地址展开网段**，可安全处理 `0.0.0.0/0`。
+
+#### 请求体
+
+```json
+{
+  "routes": [
+    {"cidr": "0.0.0.0/0",   "next_hop": "192.0.2.254", "metric": 100},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.254",  "metric": 50},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.1",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.2",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.1",    "metric": 20},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1",    "metric": 60},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.2",    "metric": 60}
+  ],
+  "targets": ["10.1.0.5", "10.2.2.2", "8.8.8.8", "172.16.0.1"]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `route_count` / `target_count` | 请求中的路由条数 / 目标数 |
+| `results[]` | 逐目标解析结果，**严格保持 targets 输入顺序** |
+| `results[].target` | 规范化后的目标 IPv4 地址 |
+| `results[].status` | `reachable` 或 `unreachable` |
+| `results[].matched_cidr` | 命中的最长前缀 CIDR（ECMP 路由的共同网段）；不可达为 `null` |
+| `results[].metric` | 命中路由的最低 metric；不可达为 `null` |
+| `results[].next_hops` | 等价下一跳，按 routes 输入顺序去重；不可达为 `[]` |
+| `summary.reachable_count` / `.unreachable_count` | 可达 / 不可达目标数 |
+| `summary.next_hop_counts[]` | 每个 next_hop 命中的目标数（ECMP 各下一跳分别计数），按 routes 首次出现位置排序 |
+
+#### 响应示例（200）
+
+上例中：`10.1.0.5` 走最长前缀 `/16`（两个 metric 60 的等价下一跳）；
+`10.2.2.2` 命中 `/8`，metric 50 的下一跳被最低 metric 20 的两个等价下一跳
+淘汰，重复的 `10.0.0.1` 只保留一次；`8.8.8.8` 与 `172.16.0.1` 走默认路由：
+
+```json
+{
+  "route_count": 7,
+  "target_count": 4,
+  "results": [
+    {
+      "target": "10.1.0.5",
+      "status": "reachable",
+      "matched_cidr": "10.1.0.0/16",
+      "metric": 60,
+      "next_hops": ["10.1.0.1", "10.1.0.2"]
+    },
+    {
+      "target": "10.2.2.2",
+      "status": "reachable",
+      "matched_cidr": "10.0.0.0/8",
+      "metric": 20,
+      "next_hops": ["10.0.0.1", "10.0.0.2"]
+    },
+    {
+      "target": "8.8.8.8",
+      "status": "reachable",
+      "matched_cidr": "0.0.0.0/0",
+      "metric": 100,
+      "next_hops": ["192.0.2.254"]
+    },
+    {
+      "target": "172.16.0.1",
+      "status": "reachable",
+      "matched_cidr": "0.0.0.0/0",
+      "metric": 100,
+      "next_hops": ["192.0.2.254"]
+    }
+  ],
+  "summary": {
+    "reachable_count": 4,
+    "unreachable_count": 0,
+    "next_hop_counts": [
+      {"next_hop": "192.0.2.254", "target_count": 2},
+      {"next_hop": "10.0.0.1", "target_count": 1},
+      {"next_hop": "10.0.0.2", "target_count": 1},
+      {"next_hop": "10.1.0.1", "target_count": 1},
+      {"next_hop": "10.1.0.2", "target_count": 1}
+    ]
+  }
+}
+```
+
+未命中任何路由的目标对应：
+
+```json
+{
+  "target": "8.8.8.8",
+  "status": "unreachable",
+  "matched_cidr": null,
+  "metric": null,
+  "next_hops": []
+}
+```
+
+#### 错误示例（422，目标重复）
+
+```json
+{
+  "detail": {
+    "error": "duplicate_targets",
+    "duplicates": [
+      {"target": "8.8.8.8", "indexes": [0, 2]}
+    ]
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/routes/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20}
+    ],
+    "targets": ["10.0.0.9", "8.8.8.8"]
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
@@ -609,6 +768,10 @@ curl -s http://localhost:8000/cidrs/hierarchy \
   类型非法（如 `true`、`1.5`）、**`id` 重复**或**规范化后网段重复**
   （后两者在 `detail.duplicate_ids` / `detail.duplicate_networks` 中列出
   冲突 id 与位置）
+- `/routes/resolve` 缺少 `routes` / `targets`、路由数超过 1000、目标数不在
+  1～500、**目标地址重复**（在 `detail.duplicates` 中列出规范化目标及全部
+  出现位置 `indexes`）、`next_hop` / `targets` 不是严格 IPv4 地址
+  （CIDR 写法、前导零、IPv6 等）、`metric` 不在 0～65535 或不是整数
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -635,8 +798,10 @@ pytest -q
 动作差异、双向分组与全空间压缩，`/explain` 的归因归属、默认项位置、
 不重不漏覆盖，`/cidrs/hierarchy` 的最长前缀超网择父、森林稳定排序、
 独占集合（仅扣直接子节点）、重复 id / 重复网段 422 与 1～500 数量边界，
-以及用标准库 `ipaddress.collapse_addresses` 作为 oracle 的随机属性测试
-（无损 + 最少块，并与逐地址暴力判定对比）。
+`/routes/resolve` 的最长前缀优先于 metric、同前缀最低 metric 选择、ECMP
+下一跳按输入顺序去重、未命中标记、逐下一跳命中汇总、重复目标 422 与
+数量/metric 边界，以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
+的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比）。
 
 ---
 
@@ -647,9 +812,11 @@ pytest -q
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因与包含层级
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy 接口
+│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve 接口
 ├── tests/
 │   ├── test_analyzer.py
+│   ├── test_router.py
 │   └── test_api.py
 ├── Dockerfile
 ├── docker-compose.yml
@@ -680,5 +847,11 @@ pytest -q
   子节点内，不重复扣除），再走“合并 + 贪心切块”得到数量最少的
   `exclusive_cidrs`；兄弟节点按 `(网络地址, 前缀长度, 输入序号)` 稳定
   排序。全程为区间运算，不逐地址枚举。
+- **路由解析**：`/routes/resolve` 先把路由 CIDR 解析为 32 位整数区间，
+  对每个目标线性扫描，仅以区间包含判断命中，先取前缀长度最大者（LPM），
+  再在其中取 metric 最小值并保留全部并列路由；其 next_hop 按 routes 输入
+  顺序去重得到 ECMP 列表。命中计数只随目标遍历累加（同一 ECMP 结果的
+  每个下一跳各计一次），汇总按 next_hop 首次出现的路由序号排序。
+  复杂度为 O(路由数 × 目标数) 的整数比较，**不逐地址展开网段**。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

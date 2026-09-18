@@ -1,4 +1,4 @@
-"""FastAPI 应用：IPv4 CIDR 遮蔽分析、规则集等价性比较与包含层级分析 API。"""
+"""FastAPI 应用：IPv4 CIDR 遮蔽分析、规则集等价性比较、包含层级分析与路由解析 API。"""
 from __future__ import annotations
 
 from typing import Literal
@@ -16,6 +16,15 @@ from .analyzer import (
     explain_query,
     parse_cidr_v4,
 )
+from .router import (
+    METRIC_MAX,
+    ROUTES_MAX,
+    TARGETS_MAX,
+    DuplicateTargetsError,
+    InvalidIPv4AddressError,
+    parse_address_v4,
+    resolve_routes,
+)
 
 app = FastAPI(
     title="IPv4 遮蔽分析 API",
@@ -25,9 +34,11 @@ app = FastAPI(
         "**完全遮蔽 (shadowed)** 分类，并将剩余集合无损压缩为数量最少的 CIDR；"
         "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价，"
         "通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决，"
-        "或通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址。"
+        "通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址，"
+        "或通过 /routes/resolve 对目标地址做最长前缀匹配、最低 metric 的"
+        "等价多路径（ECMP）路由解析。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -253,6 +264,101 @@ class HierarchyResponse(BaseModel):
 HierarchyNode.model_rebuild()
 
 
+# ---------- /routes/resolve ----------
+
+
+class RouteEntry(BaseModel):
+    """单条静态路由：严格 IPv4 CIDR + 严格 IPv4 下一跳 + metric。"""
+
+    cidr: str = Field(
+        ...,
+        description="IPv4 CIDR，如 10.0.0.0/8；纯 IP 按 /32 处理；禁止 IPv6",
+    )
+    next_hop: str = Field(
+        ..., description="下一跳 IPv4 地址（纯地址，禁止 CIDR 写法与 IPv6）"
+    )
+    metric: int = Field(
+        ..., ge=0, le=METRIC_MAX, strict=True, description="路由度量，0～65535 的整数"
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def validate_cidr(cls, value: str) -> str:
+        # 校验并规范化；非法 CIDR / IPv6 抛出 ValueError -> 422
+        return parse_cidr_v4(value)[2]
+
+    @field_validator("next_hop")
+    @classmethod
+    def validate_next_hop(cls, value: str) -> str:
+        # 校验并规范化；非法地址 / CIDR 写法 / IPv6 抛出 ValueError -> 422
+        return parse_address_v4(value)[1]
+
+
+class RouteResolveRequest(BaseModel):
+    """路由解析请求：0～1000 条路由 + 1～500 个唯一目标地址。"""
+
+    routes: list[RouteEntry] = Field(
+        ..., max_length=ROUTES_MAX, description="静态路由列表，按数组顺序作为去重/ECMP 次序"
+    )
+    targets: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=TARGETS_MAX,
+        description="目标 IPv4 地址列表（纯地址），全请求内唯一；响应保持该顺序",
+    )
+
+    @field_validator("targets", mode="before")
+    @classmethod
+    def validate_targets(cls, value: object) -> object:
+        # 逐地址严格校验并规范化；非法地址 / CIDR 写法 / IPv6 -> 422
+        if isinstance(value, list):
+            return [parse_address_v4(item)[1] for item in value]
+        return value
+
+
+class ResolvedTarget(BaseModel):
+    target: str = Field(..., description="规范化后的目标 IPv4 地址")
+    status: Literal["reachable", "unreachable"]
+    matched_cidr: str | None = Field(
+        ..., description="命中的最长前缀 CIDR（ECMP 路由共同网段）；不可达为 null"
+    )
+    metric: int | None = Field(
+        ..., description="命中路由的最低 metric；不可达为 null"
+    )
+    next_hops: list[str] = Field(
+        ...,
+        description="等价下一跳列表，按 routes 输入顺序去重；不可达为空",
+    )
+
+
+class NextHopCount(BaseModel):
+    next_hop: str = Field(..., description="规范化后的下一跳 IPv4 地址")
+    target_count: int = Field(
+        ..., description="该下一跳命中的目标数（同一 ECMP 结果的各下一跳分别计一次）"
+    )
+
+
+class RouteResolveSummary(BaseModel):
+    reachable_count: int = Field(..., description="可达目标数")
+    unreachable_count: int = Field(..., description="不可达目标数")
+    next_hop_counts: list[NextHopCount] = Field(
+        ...,
+        description=(
+            "每个 next_hop 命中的目标数，按 next_hop 在 routes 中的首次出现"
+            "位置排序；仅列实际命中过的下一跳"
+        ),
+    )
+
+
+class RouteResolveResponse(BaseModel):
+    route_count: int = Field(..., description="请求中的路由条数")
+    target_count: int = Field(..., description="请求中的目标数")
+    results: list[ResolvedTarget] = Field(
+        ..., description="逐目标解析结果，严格保持 targets 输入顺序"
+    )
+    summary: RouteResolveSummary
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -371,5 +477,43 @@ def cidr_hierarchy(request: HierarchyRequest) -> dict:
             },
         ) from exc
     except InvalidCIDRError:
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/routes/resolve",
+    response_model=RouteResolveResponse,
+    tags=["routes"],
+    summary="按最长前缀匹配、最低 metric 解析目标地址的等价下一跳",
+)
+def routes_resolve(request: RouteResolveRequest) -> dict:
+    """对每个目标先做**最长前缀匹配（LPM）**，再在命中路由中保留
+    **最低 metric** 的全部路由，其 `next_hop` 构成等价多路径（ECMP）结果，
+    按 `routes` 输入顺序**去重**后返回；未命中任何路由的目标标记为
+    `unreachable`。
+
+    - `results` 严格保持 `targets` 输入顺序；
+    - `summary.next_hop_counts` 汇总每个 next_hop 命中的**目标数**
+      （同一 ECMP 结果的各下一跳分别计一次），按 next_hop 在 routes 中
+      的首次出现位置排序；
+    - `targets` 必须唯一，重复时返回 **422** 并列出冲突位置；
+    - CIDR / 目标 / 下一跳均沿用严格 IPv4 校验，`metric` 为 0～65535；
+      路由最多 1000 条、目标 1～500 个。
+
+    全程只做 32 位整数比较，**不逐地址展开网段**。
+    """
+    try:
+        return resolve_routes(
+            [(route.cidr, route.next_hop, route.metric) for route in request.routes],
+            list(request.targets),
+        )
+    except DuplicateTargetsError as exc:
+        # 重复目标：422 并列出规范化目标与其全部出现位置
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "duplicate_targets", "duplicates": exc.duplicates},
+        ) from exc
+    except (InvalidCIDRError, InvalidIPv4AddressError):
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
         raise
